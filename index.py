@@ -46,8 +46,8 @@ def load_model():
     print("Loading model...")
     h5model = tables.open_file(MODEL_PATH, mode='r')
 
-    # Build k-d tree with K=3 (for top 3 nearest predictions)
-    nn_model = NearestNeighbors(n_neighbors=3, algorithm='kd_tree')
+    # Build k-d tree with K=10 (we'll get top 3 unique artists from these)
+    nn_model = NearestNeighbors(n_neighbors=10, algorithm='kd_tree')
     training_feats = h5model.root.data.feats.read()
 
     # Handle 3D arrays if needed
@@ -57,18 +57,18 @@ def load_model():
 
     nn_model.fit(training_feats)
     print("Model loaded successfully!")
-
+    
     print("Building learnable artists cache...")
     all_artist_ids = h5model.root.data.artist_id.read()
     artist_ids_decoded = [aid.decode('utf-8') if isinstance(aid, bytes) else aid for aid in all_artist_ids]
-
+    
     artist_counts = Counter(artist_ids_decoded)
-
+    
     learnable_artists = {
         artist_id for artist_id, count in artist_counts.items()
         if count >= MIN_TRAINING_EXAMPLES
     }
-
+    
     print(f"Found {len(learnable_artists)} learnable artists (out of {len(artist_counts)} total)")
     print(f"Learnable artists have {MIN_TRAINING_EXAMPLES}+ training examples")
 
@@ -115,8 +115,8 @@ def find_track_by_title(song_title):
         print(f"Error searching for song: {e}")
         return None
 
-def get_top_predictions(track_id, k=3):
-    """Get top-k artist predictions for track_id"""
+def get_top_predictions(track_id, k=10):
+    """Get top-k artist predictions for track_id (using k=10 to get enough unique artists)"""
     try:
         filepath = fullpath_from_trackid(track_id)
 
@@ -136,47 +136,63 @@ def get_top_predictions(track_id, k=3):
         if feats_to_predict.ndim == 1:
             feats_to_predict = feats_to_predict.reshape(1, -1)
 
-        distances, indices = nn_model.kneighbors(feats_to_predict)
+        distances, indices = nn_model.kneighbors(feats_to_predict, n_neighbors=k)
 
-        # Get artist IDs and their frequencies
+        # Get artist IDs with their distances (for confidence calculation)
         indices_flat = indices.flatten()
+        distances_flat = distances.flatten()
+        
         artist_votes = {}
 
-        for pos, idx in enumerate(indices_flat):
+        for pos, (idx, dist) in enumerate(zip(indices_flat, distances_flat)):
             artist_id = h5model.root.data.artist_id[idx]
+            
             if artist_id not in artist_votes:
                 artist_votes[artist_id] = { 
-                    'count' : 1,
-                    'best_rank' : pos,
-                    'total_rank' : pos
+                    'count': 1,
+                    'best_rank': pos,
+                    'best_distance': dist,
+                    'total_distance': dist
                 }
             else:
                 artist_votes[artist_id]['count'] += 1
-                artist_votes[artist_id]['total_rank'] += pos
+                artist_votes[artist_id]['total_distance'] += dist
             
-        # Sort the artists by count (descending), then by rank (ascending)
+        # Sort the artists by count (descending), then by best distance (ascending)
         sorted_artists = sorted(
             artist_votes.items(),
-            key = lambda x: (-x[1]['count'], x[1]['best_rank'])
+            key=lambda x: (-x[1]['count'], x[1]['best_distance'])
         )
 
+        # This is a completely skunked confidence calculation. I just can't figure out how to make the scores reflect the real confidence
         top_artists = []
-        for artist_id, stats in sorted_artists[:4]:
+        
+        for i, (artist_id, stats) in enumerate(sorted_artists[:3]):
             artist_name = get_artist_name_from_id(artist_id)
+            base_score = (stats['count'] / k) * 100
+            
+            rank_bonus = max(40 - (stats['best_rank'] * 4), 0)
+            position_penalty = i * 12
+            
+            confidence = base_score + rank_bonus - position_penalty
+            confidence = max(5, min(95, confidence))
+            
             top_artists.append({
-                'artist_id' : artist_id.decode('utf-8') if isinstance(artist_id, bytes) else artist_id,
-                'artist_name' : artist_name,
-                'confidence' : stats['count'] / k # Proportion of votes
+                'artist_id': artist_id.decode('utf-8') if isinstance(artist_id, bytes) else artist_id,
+                'artist_name': artist_name,
+                'confidence': round(confidence, 1),
+                'votes': stats['count'],  # How many neighbors voted for this
+                'rank': stats['best_rank'] + 1  # Best rank (1-indexed)
             })
 
         actual_artist_name = get_artist_name_from_id(actual_artist_id)
         actual_artist_id_str = actual_artist_id.decode('utf-8') if isinstance(actual_artist_id, bytes) else actual_artist_id
 
         return {
-            'predictions' : top_artists,
-            'actual' : {
-                'artist_id' : actual_artist_id_str,
-                'artist_name' : actual_artist_name
+            'predictions': top_artists,
+            'actual': {
+                'artist_id': actual_artist_id_str,
+                'artist_name': actual_artist_name
             }
         }, None
     
@@ -185,38 +201,39 @@ def get_top_predictions(track_id, k=3):
 
 @app.route('/random-song', methods=['GET'])
 def random_song():
-    """Gets a random song from the test set (Returns a lot of metadata)"""
+    """Gets a random song from learnable artists only (artists with 3+ training examples)"""
     try:
         conn = sqlite3.connect(TMDB_PATH)
         cursor = conn.cursor()
 
         if not learnable_artists:
-            return jsonify({ 'error': 'No learnable artists found. Model may not be loaded.' }), 500
+            return jsonify({'error': 'No learnable artists found. Model may not be loaded.'}), 500
         
         placeholders = ','.join('?' * len(learnable_artists))
-
-        # Get a random song with all available metadata
-        cursor.execute(f"""
-            SELECT track_id, title, artist_name, year, duration
+        
+        query = f"""
+            SELECT track_id, title, artist_name, artist_id, year, duration
             FROM songs
             WHERE track_id IS NOT NULL
-            AND artist_id in ({placeholders})
+            AND artist_id IN ({placeholders})
             ORDER BY RANDOM()
             LIMIT 1
-        """, tuple(learnable_artists))
+        """
+        
+        cursor.execute(query, tuple(learnable_artists))
         result = cursor.fetchone()
         conn.close()
 
         if not result:
-            return jsonify({'error' : 'No songs found from learnable artists'}), 404
+            return jsonify({'error': 'No songs found from learnable artists'}), 404
         
-        track_id, title, artist, year, duration = result
+        track_id, title, artist, artist_id, year, duration = result
 
-        # Get top 3 predictions for the song
-        predictions_result, error = get_top_predictions(track_id, k=3)
+        # Get top 3 predictions for the song (using k=10 to ensure 3 unique artists)
+        predictions_result, error = get_top_predictions(track_id, k=10)
 
         if error:
-            return jsonify({'error' : error }), 500
+            return jsonify({'error': error}), 500
         
         # Get the audio features from the HDF5 file
         filepath = fullpath_from_trackid(track_id)
@@ -236,20 +253,21 @@ def random_song():
                 }
                 h5.close()
             except Exception as e:
-                print(f"Error extracing audio features: {e}")
+                print(f"Error extracting audio features: {e}")
         
         return jsonify({
-            'track_id' : track_id,
-            'song_title' : title,
-            'year' : int(year) if year and year > 0 else None,
-            'duration' : float(duration) if duration else None,
-            'predictions' : predictions_result['predictions'],
-            'actual' : predictions_result['actual'],
-            'audio_features' : audio_features
+            'track_id': track_id,
+            'song_title': title,
+            'year': int(year) if year and year > 0 else None,
+            'duration': float(duration) if duration else None,
+            'predictions': predictions_result['predictions'],
+            'actual': predictions_result['actual'],
+            'audio_features': audio_features
         })
     
     except Exception as e:
-        return jsonify({'error' : f'Error getting random song: {str(e)}'}), 500
+        return jsonify({'error': f'Error getting random song: {str(e)}'}), 500
+
 
 @app.route('/stats', methods=['GET'])
 def stats():
@@ -257,43 +275,46 @@ def stats():
     try:
         conn = sqlite3.connect(TMDB_PATH)
         cursor = conn.cursor()
-
+        
         cursor.execute("SELECT COUNT(*) FROM songs WHERE track_id IS NOT NULL")
         total_songs = cursor.fetchone()[0]
-
+        
         cursor.execute("SELECT COUNT(DISTINCT artist_id) FROM songs")
         total_artists = cursor.fetchone()[0]
-
+        
         if learnable_artists:
             placeholders = ','.join('?' * len(learnable_artists))
-            cursor.execute(f"SELECT COUNT(*) FROM songs WHERE artist_id IN ({placeholders})", tuple(learnable_artists))
+            cursor.execute(f"SELECT COUNT(*) FROM songs WHERE artist_id IN ({placeholders})", 
+                          tuple(learnable_artists))
             learnable_songs = cursor.fetchone()[0]
         else:
             learnable_songs = 0
-
+        
         conn.close()
-
+        
         total_training_examples = len(h5model.root.data.artist_id.read()) if h5model else 0
-
+        
         return jsonify({
-            'total_songs_in_database' : total_songs,
-            'total_artists_in_database' : total_artists,
-            'total_training_examples' : total_training_examples,
-            'learnable_artists_count' : len(learnable_artists),
-            'learnable_songs_count' : learnable_songs,
-            'min_training_examples_threshold' : MIN_TRAINING_EXAMPLES,
-            'playable_percentage' : round((learnable_songs / total_songs * 100), 2) if total_songs > 0 else 0
+            'total_songs_in_database': total_songs,
+            'total_artists_in_database': total_artists,
+            'total_training_examples': total_training_examples,
+            'learnable_artists_count': len(learnable_artists),
+            'learnable_songs_count': learnable_songs,
+            'min_training_examples_threshold': MIN_TRAINING_EXAMPLES,
+            'playable_percentage': round((learnable_songs / total_songs * 100), 2) if total_songs > 0 else 0
         })
-    
+        
     except Exception as e:
-        return jsonify({ 'error' : f'Error getting stats: {str(e)}'}), 500
+        return jsonify({'error': f'Error getting stats: {str(e)}'}), 500
+
 
 @app.route('/health', methods=['GET'])
 def health():
     """Health check endpoint"""
     return jsonify({
         'status': 'ok',
-        'model_loaded': nn_model is not None
+        'model_loaded': nn_model is not None,
+        'learnable_artists_loaded': len(learnable_artists) > 0
     })
 
 @app.route('/debug-song', methods=['POST'])
@@ -306,13 +327,13 @@ def debug_song():
     try:
         data = request.get_json()
         if not data or 'song_title' not in data:
-            return jsonify({'error' : 'Missing song_title in request body'}), 400
+            return jsonify({'error': 'Missing song_title in request body'}), 400
         
         song_title = data['song_title']
         song_info = find_track_by_title(song_title)
         
         if not song_info:
-            return jsonify({'error' : f'Song "{song_title}" not found'}), 404
+            return jsonify({'error': f'Song "{song_title}" not found'}), 404
         
         track_id, actual_title, actual_artist, artist_id = song_info
         
@@ -352,19 +373,19 @@ def debug_song():
                 break
         
         return jsonify({
-            'song_title' : actual_title,
-            'actual_artist' : actual_artist,
-            'actual_artist_id' : artist_id_str,
-            'diagnostics' : {
-                'artist_in_training_data' : artist_in_training,
-                'training_examples_for_this_artist' : training_examples_count,
-                'is_learnable' : artist_id_str in learnable_artists,
-                'total_songs_by_artist_in_db' : artist_song_count,
-                'total_artists_in_database' : total_artists_in_db,
-                'total_training_examples' : len(all_artist_ids),
-                'correct_artist_rank' : correct_rank if correct_rank else 'Not in top 10',
+            'song_title': actual_title,
+            'actual_artist': actual_artist,
+            'actual_artist_id': artist_id_str,
+            'diagnostics': {
+                'artist_in_training_data': artist_in_training,
+                'training_examples_for_this_artist': training_examples_count,
+                'is_learnable': artist_id_str in learnable_artists,
+                'total_songs_by_artist_in_db': artist_song_count,
+                'total_artists_in_database': total_artists_in_db,
+                'total_training_examples': len(all_artist_ids),
+                'correct_artist_rank': correct_rank if correct_rank else 'Not in top 10',
             },
-            'top_10_predictions' : result['predictions']
+            'top_10_predictions': result['predictions']
         })
         
     except Exception as e:
