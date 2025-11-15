@@ -141,6 +141,68 @@ def get_top_predictions(track_id, k=3):
     except Exception as e:
         return None, f"Error making predictions: {str(e)}"
 
+@app.route('/random-song', methods=['GET'])
+def random_song():
+    """Gets a random song from the test set (Returns a lot of metadata)"""
+    try:
+        conn = sqlite3.connect(TMDB_PATH)
+        cursor = conn.cursor()
+
+        # Get a random song with all available metadata
+        cursor.execute("""
+            SELECT track_id, title, artist_name, year, duration
+            FROM songs
+            WHERE track_id IS NOT NULL
+            ORDER BY RANDOM()
+            LIMIT 1
+        """)
+        result = cursor.fetchone()
+        conn.close()
+
+        if not result:
+            return jsonify({'error' : 'No songs found'}), 404
+        
+        track_id, title, artist, year, duration = result
+
+        # Get top 3 predictions for the song
+        predictions_result, error = get_top_predictions(track_id, k=3)
+
+        if error:
+            return jsonify({'error' : error }), 500
+        
+        # Get the audio features from the HDF5 file
+        filepath = fullpath_from_trackid(track_id)
+        audio_features = None
+
+        if os.path.isfile(filepath):
+            try:
+                h5 = GETTERS.open_h5_file_read(filepath)
+                audio_features = {
+                    'tempo': float(GETTERS.get_tempo(h5)) if GETTERS.get_tempo(h5) else None,
+                    'loudness': float(GETTERS.get_loudness(h5)) if GETTERS.get_loudness(h5) else None,
+                    'key': int(GETTERS.get_key(h5)) if GETTERS.get_key(h5) is not None else None,
+                    'mode': int(GETTERS.get_mode(h5)) if GETTERS.get_mode(h5) is not None else None,
+                    'time_signature': int(GETTERS.get_time_signature(h5)) if GETTERS.get_time_signature(h5) else None,
+                    'energy': float(GETTERS.get_energy(h5)) if GETTERS.get_energy(h5) else None,
+                    'danceability': float(GETTERS.get_danceability(h5)) if GETTERS.get_danceability(h5) else None,
+                }
+                h5.close()
+            except Exception as e:
+                print(f"Error extracing audio features: {e}")
+        
+        return jsonify({
+            'track_id' : track_id,
+            'song_title' : title,
+            'year' : int(year) if year and year > 0 else None,
+            'duration' : float(duration) if duration else None,
+            'predictions' : predictions_result['predictions'],
+            'actual' : predictions_result['actual'],
+            'audio_features' : audio_features
+        })
+    
+    except Exception as e:
+        return jsonify({'error' : f'Error getting random song: {str(e)}'}), 500
+
 
 
 @app.route('/health', methods=['GET'])
@@ -150,82 +212,6 @@ def health():
         'status': 'ok',
         'model_loaded': nn_model is not None
     })
-
-@app.route('/debug-song', methods=['POST'])
-def debug_song():
-    """
-    Debug endpoint to analyze why predictions might be failing
-    
-    Request body: {"song_title": "Song Name"}
-    """
-    try:
-        data = request.get_json()
-        if not data or 'song_title' not in data:
-            return jsonify({'error': 'Missing song_title in request body'}), 400
-        
-        song_title = data['song_title']
-        song_info = find_track_by_title(song_title)
-        
-        if not song_info:
-            return jsonify({'error': f'Song "{song_title}" not found'}), 404
-        
-        track_id, actual_title, actual_artist, artist_id = song_info
-        
-        # Check if this artist exists in training data
-        conn = sqlite3.connect(TMDB_PATH)
-        cursor = conn.cursor()
-        
-        # Count how many songs by this artist are in the dataset
-        cursor.execute("SELECT COUNT(*) FROM songs WHERE artist_id = ?", (artist_id,))
-        artist_song_count = cursor.fetchone()[0]
-        
-        # Check unique artists in training data
-        if isinstance(artist_id, bytes):
-            artist_id_str = artist_id.decode('utf-8')
-        else:
-            artist_id_str = artist_id
-        
-        # Check if artist is in training model
-        all_artist_ids = h5model.root.data.artist_id.read()
-        artist_ids_decoded = [aid.decode('utf-8') if isinstance(aid, bytes) else aid for aid in all_artist_ids]
-        artist_in_training = artist_id_str in artist_ids_decoded
-        training_examples_count = artist_ids_decoded.count(artist_id_str) if artist_in_training else 0
-        
-        cursor.execute("SELECT COUNT(DISTINCT artist_id) FROM songs")
-        total_artists_in_db = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        # Get predictions
-        result, error = get_top_predictions(track_id, k=10)  # Get top 10 for debugging
-        
-        if error:
-            return jsonify({'error': error}), 500
-        
-        # Find rank of correct artist
-        correct_rank = None
-        for i, pred in enumerate(result['predictions']):
-            if pred['artist_id'] == artist_id_str:
-                correct_rank = i + 1
-                break
-        
-        return jsonify({
-            'song_title': actual_title,
-            'actual_artist': actual_artist,
-            'actual_artist_id': artist_id_str,
-            'diagnostics': {
-                'artist_in_training_data': artist_in_training,
-                'training_examples_for_this_artist': training_examples_count,
-                'total_songs_by_artist_in_db': artist_song_count,
-                'total_artists_in_database': total_artists_in_db,
-                'total_training_examples': len(all_artist_ids),
-                'correct_artist_rank': correct_rank if correct_rank else 'Not in top 10',
-            },
-            'top_10_predictions': result['predictions']
-        })
-        
-    except Exception as e:
-        return jsonify({'error': f'Debug error: {str(e)}'}), 500
 
 if __name__ == '__main__':
     try:
