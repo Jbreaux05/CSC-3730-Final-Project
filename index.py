@@ -5,6 +5,7 @@ Exposes Top 3 predictions given a song title
 NOTE: I know Flask is EXTREMELY unsafe to use in a production setting, so if I were to be making this for a real job (or have more time), I would use Java SpringBoot or C#'s Minimal API
 """
 
+from collections import Counter
 from flask import Flask, request, jsonify
 import sqlite3
 import numpy as np
@@ -20,9 +21,12 @@ MODEL_PATH = 'trained_knn_unbalanced.h5'
 TMDB_PATH = 'track_metadata.db'
 MSD_DIR = 'D:\\MillionSongSubset'
 
+MIN_TRAINING_EXAMPLES = 3 # The minimum training examples required for an artist to be "learnable" by ML
+
 nn_model = None
 h5model = None
 training_feats = None
+learnable_artists = set() # A cache of artists with enough training data to be predictable
 
 def fullpath_from_trackid(trackid):
     """Pretty please serialize the trackid before going through here, it literally could expose the host's file system :skull:"""
@@ -34,7 +38,7 @@ def fullpath_from_trackid(trackid):
 
 def load_model():
     """Load the trained model and build k-d tree once at startup"""
-    global nn_model, h5model, training_feats
+    global nn_model, h5model, training_feats, learnable_artists
 
     if not os.path.isfile(MODEL_PATH):
         raise FileNotFoundError(f"Model file {MODEL_PATH} not found")
@@ -54,6 +58,20 @@ def load_model():
     nn_model.fit(training_feats)
     print("Model loaded successfully!")
 
+    print("Building learnable artists cache...")
+    all_artist_ids = h5model.root.data.artist_id.read()
+    artist_ids_decoded = [aid.decode('utf-8') if isinstance(aid, bytes) else aid for aid in all_artist_ids]
+
+    artist_counts = Counter(artist_ids_decoded)
+
+    learnable_artists = {
+        artist_id for artist_id, count in artist_counts.items()
+        if count >= MIN_TRAINING_EXAMPLES
+    }
+
+    print(f"Found {len(learnable_artists)} learnable artists (out of {len(artist_counts)} total)")
+    print(f"Learnable artists have {MIN_TRAINING_EXAMPLES}+ training examples")
+
 def get_artist_name_from_id(artist_id):
     """Look up artist name from artist_id in track_metadata.db"""
     try:
@@ -72,6 +90,30 @@ def get_artist_name_from_id(artist_id):
     except Exception as e:
         print(f"Error looking up artist name: {e}")
         return "Unknown Artist"
+    
+def find_track_by_title(song_title):
+    """Search for a song by title in track_metadata.db"""
+    try:
+        conn = sqlite3.connect(TMDB_PATH)
+        cursor = conn.cursor()
+
+        # Exact match exists?
+        cursor.execute("SELECT track_id, title, artist_name, artist_id FROM songs WHERE title = ?", (song_title,))
+        result = cursor.fetchone()
+        
+        # Case insensitive match exists?
+        if not result:
+            cursor.execute(
+                "SELECT track_id, title, artist_name, artist_id FROM songs WHERE title LIKE ? LIMIT 1",
+                (f"%{song_title}%",)
+            )
+            result = cursor.fetchone()
+        
+        conn.close()
+        return result  # (track_id, title, artist_name, artist_id)
+    except Exception as e:
+        print(f"Error searching for song: {e}")
+        return None
 
 def get_top_predictions(track_id, k=3):
     """Get top-k artist predictions for track_id"""
@@ -148,19 +190,25 @@ def random_song():
         conn = sqlite3.connect(TMDB_PATH)
         cursor = conn.cursor()
 
+        if not learnable_artists:
+            return jsonify({ 'error': 'No learnable artists found. Model may not be loaded.' }), 500
+        
+        placeholders = ','.join('?' * len(learnable_artists))
+
         # Get a random song with all available metadata
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT track_id, title, artist_name, year, duration
             FROM songs
             WHERE track_id IS NOT NULL
+            AND artist_id in ({placeholders})
             ORDER BY RANDOM()
             LIMIT 1
-        """)
+        """, tuple(learnable_artists))
         result = cursor.fetchone()
         conn.close()
 
         if not result:
-            return jsonify({'error' : 'No songs found'}), 404
+            return jsonify({'error' : 'No songs found from learnable artists'}), 404
         
         track_id, title, artist, year, duration = result
 
@@ -212,6 +260,80 @@ def health():
         'status': 'ok',
         'model_loaded': nn_model is not None
     })
+
+@app.route('/debug-song', methods=['POST'])
+def debug_song():
+    """
+    Debug endpoint to analyze why predictions might be failing
+    
+    Request body: {"song_title": "Song Name"}
+    """
+    try:
+        data = request.get_json()
+        if not data or 'song_title' not in data:
+            return jsonify({'error' : 'Missing song_title in request body'}), 400
+        
+        song_title = data['song_title']
+        song_info = find_track_by_title(song_title)
+        
+        if not song_info:
+            return jsonify({'error' : f'Song "{song_title}" not found'}), 404
+        
+        track_id, actual_title, actual_artist, artist_id = song_info
+        
+        conn = sqlite3.connect(TMDB_PATH)
+        cursor = conn.cursor()
+        
+        # Count how many songs by this artist are in the dataset
+        cursor.execute("SELECT COUNT(*) FROM songs WHERE artist_id = ?", (artist_id,))
+        artist_song_count = cursor.fetchone()[0]
+        
+        if isinstance(artist_id, bytes):
+            artist_id_str = artist_id.decode('utf-8')
+        else:
+            artist_id_str = artist_id
+        
+        # Check if artist is in training model
+        all_artist_ids = h5model.root.data.artist_id.read()
+        artist_ids_decoded = [aid.decode('utf-8') if isinstance(aid, bytes) else aid for aid in all_artist_ids]
+        artist_in_training = artist_id_str in artist_ids_decoded
+        training_examples_count = artist_ids_decoded.count(artist_id_str) if artist_in_training else 0
+        
+        cursor.execute("SELECT COUNT(DISTINCT artist_id) FROM songs")
+        total_artists_in_db = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        result, error = get_top_predictions(track_id, k=10)  # Get top 10 for debugging
+        
+        if error:
+            return jsonify({'error': error}), 500
+        
+        # Find rank of correct artist
+        correct_rank = None
+        for i, pred in enumerate(result['predictions']):
+            if pred['artist_id'] == artist_id_str:
+                correct_rank = i + 1
+                break
+        
+        return jsonify({
+            'song_title' : actual_title,
+            'actual_artist' : actual_artist,
+            'actual_artist_id' : artist_id_str,
+            'diagnostics' : {
+                'artist_in_training_data' : artist_in_training,
+                'training_examples_for_this_artist' : training_examples_count,
+                'is_learnable' : artist_id_str in learnable_artists,
+                'total_songs_by_artist_in_db' : artist_song_count,
+                'total_artists_in_database' : total_artists_in_db,
+                'total_training_examples' : len(all_artist_ids),
+                'correct_artist_rank' : correct_rank if correct_rank else 'Not in top 10',
+            },
+            'top_10_predictions' : result['predictions']
+        })
+        
+    except Exception as e:
+        return jsonify({'error': f'Debug error: {str(e)}'}), 500
 
 if __name__ == '__main__':
     try:
