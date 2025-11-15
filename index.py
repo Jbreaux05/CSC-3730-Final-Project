@@ -251,7 +251,42 @@ def random_song():
     except Exception as e:
         return jsonify({'error' : f'Error getting random song: {str(e)}'}), 500
 
+@app.route('/stats', methods=['GET'])
+def stats():
+    """Get statistics about the model and learnability"""
+    try:
+        conn = sqlite3.connect(TMDB_PATH)
+        cursor = conn.cursor()
 
+        cursor.execute("SELECT COUNT(*) FROM songs WHERE track_id IS NOT NULL")
+        total_songs = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(DISTINCT artist_id) FROM songs")
+        total_artists = cursor.fetchone()[0]
+
+        if learnable_artists:
+            placeholders = ','.join('?' * len(learnable_artists))
+            cursor.execute(f"SELECT COUNT(*) FROM songs WHERE artist_id IN ({placeholders})", tuple(learnable_artists))
+            learnable_songs = cursor.fetchone()[0]
+        else:
+            learnable_songs = 0
+
+        conn.close()
+
+        total_training_examples = len(h5model.root.data.artist_id.read()) if h5model else 0
+
+        return jsonify({
+            'total_songs_in_database' : total_songs,
+            'total_artists_in_database' : total_artists,
+            'total_training_examples' : total_training_examples,
+            'learnable_artists_count' : len(learnable_artists),
+            'learnable_songs_count' : learnable_songs,
+            'min_training_examples_threshold' : MIN_TRAINING_EXAMPLES,
+            'playable_percentage' : round((learnable_songs / total_songs * 100), 2) if total_songs > 0 else 0
+        })
+    
+    except Exception as e:
+        return jsonify({ 'error' : f'Error getting stats: {str(e)}'}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
