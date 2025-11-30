@@ -7,6 +7,7 @@ NOTE: I know Flask is EXTREMELY unsafe to use in a production setting, so if I w
 
 from collections import Counter
 from flask import Flask, request, jsonify
+from flask_cors import cross_origin
 import sqlite3
 import numpy as np
 import tables
@@ -200,6 +201,7 @@ def get_top_predictions(track_id, k=10):
         return None, f"Error making predictions: {str(e)}"
 
 @app.route('/random-song', methods=['GET'])
+@cross_origin()
 def random_song():
     """Gets a random song from learnable artists only (artists with 3+ training examples)"""
     try:
@@ -270,6 +272,7 @@ def random_song():
 
 
 @app.route('/stats', methods=['GET'])
+@cross_origin()
 def stats():
     """Get statistics about the model and learnability"""
     try:
@@ -309,6 +312,7 @@ def stats():
 
 
 @app.route('/health', methods=['GET'])
+@cross_origin()
 def health():
     """Health check endpoint"""
     return jsonify({
