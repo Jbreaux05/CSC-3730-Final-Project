@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 MODEL_PATH = 'trained_knn_unbalanced.h5'
 TMDB_PATH = 'track_metadata.db'
-MSD_DIR = 'D:\\MillionSongSubset'
+MSD_DIR = 'MillionSongSubset'
 
 MIN_TRAINING_EXAMPLES = 3 # The minimum training examples required for an artist to be "learnable" by ML
 
