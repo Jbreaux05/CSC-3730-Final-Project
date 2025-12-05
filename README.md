@@ -12,10 +12,21 @@ The project is (somewhat) divided into two main components.
 
 ## Prerequisites
 
-* **Python 3.8+**
+* **Python 3.13+**
 * **Node.js 18+** & **npm**
+* **Git**
 
 ## Setup Instructions
+
+### Preliminary Step
+
+Clone the repo
+```bash
+git clone https://github.com/Jbreaux05/CSC-3730-Final-Project
+cd CSC-3730-Final-Project
+```
+
+---
 
 To run the demo, you will need two separate terminal windows open.
 
@@ -38,6 +49,7 @@ The Flask server (`index.py`) acts as the API. It must be running for the fronte
     ```bash
     pip install -r requirements.txt
     ```
+    *If you have an issue with this step, it's because your venv is NOT on Python 3.13*
 4. Start the Server:
     ```bash
     python index.py
